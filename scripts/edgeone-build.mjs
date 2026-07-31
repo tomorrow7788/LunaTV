@@ -290,7 +290,7 @@ function injectLayoutAuthCheck() {
     try { if (__ref) __path = new URL(__ref).pathname; } catch {}
   }
   
-  if (!__path) __path = '/';
+  if (!__path) __path = '/login';
 
   // Critical fix: Ensure /login exactly matches regardless of trailing slash
   const __skipPaths = ${pageSkipPaths};
