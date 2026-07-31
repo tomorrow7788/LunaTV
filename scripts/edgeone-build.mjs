@@ -234,9 +234,6 @@ function convertProxyToMiddlewareForBuild() {
 }
 
 // 构建前：在 layout.tsx 的 RootLayout 函数体内注入服务端认证检查
-// EdgeOne 页面请求绕过 edge middleware，需要在 SSR 层（RootLayout）做认证
-// 注意：layout.tsx 有两处 await cookies()，第一处在 generateMetadata，第二处才在 RootLayout
-// 必须注入到 RootLayout 内的那处，否则 generateMetadata 会触发 redirect 导致整个 app 崩溃
 function injectLayoutAuthCheck() {
   const layoutPath = join(process.cwd(), 'src', 'app', 'layout.tsx');
   if (!existsSync(layoutPath)) {
@@ -261,8 +258,6 @@ function injectLayoutAuthCheck() {
     `${importMarker}\n${marker}\nimport { redirect } from 'next/navigation';\nimport { headers } from 'next/headers';`
   );
 
-  // 找 RootLayout 函数体内的 await cookies()，不是第一个（generateMetadata 里的）
-  // 通过先定位 "export default async function RootLayout" 再在其后找 await cookies()
   const rootLayoutMarker = 'export default async function RootLayout(';
   const rootLayoutIdx = content.indexOf(rootLayoutMarker);
   if (rootLayoutIdx === -1) {
@@ -278,22 +273,43 @@ function injectLayoutAuthCheck() {
   }
 
   const authCheck = `
-  // EdgeOne SSR auth guard
+  // EdgeOne SSR auth guard (Enhanced fallback)
   const __h = await headers();
   let __path = __h.get('x-pathname') || __h.get('x-invoke-path') || '';
+  
+  if (!__path) {
+    // EdgeOne specific headers often contain the full original URI
+    const __eoUrl = __h.get('x-eo-request-url') || __h.get('x-forwarded-uri') || '';
+    if (__eoUrl) {
+      try { __path = new URL(__eoUrl, 'http://localhost').pathname; } catch {}
+    }
+  }
+
   if (!__path) {
     const __ref = __h.get('referer') || '';
     try { if (__ref) __path = new URL(__ref).pathname; } catch {}
   }
+  
   if (!__path) __path = '/';
 
+  // Critical fix: Ensure /login exactly matches regardless of trailing slash
   const __skipPaths = ${pageSkipPaths};
-  if (!__skipPaths.some((p) => __path.startsWith(p))) {
+  const __isSkip = __skipPaths.some((p) => {
+    if (p === '/login') {
+       return __path === '/login' || __path.startsWith('/login?') || __path.startsWith('/login/');
+    }
+    return __path.startsWith(p);
+  });
+
+  if (!__isSkip) {
     const __cookieStore = await cookies();
     const __authCookie = __cookieStore.get('user_auth') || __cookieStore.get('auth');
     if (!__authCookie) {
-      const __search = __h.get('x-search') || '';
-      redirect('/login?redirect=' + encodeURIComponent(__path + __search));
+      // 避免重复重定向到 login 导致死循环
+      if (!__path.includes('login')) {
+         const __search = __h.get('x-search') || '';
+         redirect('/login?redirect=' + encodeURIComponent(__path + __search));
+      }
     }
   }
 `;
