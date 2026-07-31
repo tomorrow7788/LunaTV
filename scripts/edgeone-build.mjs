@@ -159,7 +159,6 @@ function patchEdgeFunctionEnvInjection() {
     );
   }
 
-  // 兼容 Next.js 16 proxy.ts（executeMiddleware，构建时已临时转换）
   const middlewareSignature = 'async function executeMiddleware({request}) {';
   const middlewareMarker = '/* edgeone-middleware-env-injected */';
   if (!code.includes(middlewareMarker) && !code.includes(middlewareSignature)) {
@@ -175,9 +174,6 @@ function patchEdgeFunctionEnvInjection() {
   console.log('[edgeone-build] Patched edge function process.env injection');
 }
 
-// 构建前：将 proxy.ts 转换为 middleware.ts
-// EdgeOne 不完整支持 Next.js 16 proxy.ts，需要临时转换
-// 同时简化 matcher（EdgeOne 不支持负向前瞻正则）并注入跳过路径
 function convertProxyToMiddlewareForBuild() {
   const proxyPath = join(process.cwd(), 'src', 'proxy.ts');
   const middlewarePath = join(process.cwd(), 'src', 'middleware.ts');
@@ -190,15 +186,11 @@ function convertProxyToMiddlewareForBuild() {
 
   content = content.replace(/export async function proxy\b/, 'export async function middleware');
 
-  // 简化 matcher：EdgeOne 不支持 (?!...)，改用匹配所有路径
-  // 注意：不能用 /:path+（不匹配根路径 /），必须用 /:path*
   content = content.replace(
     /export const config = \{[\s\S]*?matcher[\s\S]*?\};/,
     `export const config = { matcher: ['/', '/:path*'] };`
   );
 
-  // 在 middleware 函数体开头注入跳过路径检查
-  // 替代原 matcher 负向前瞻排除的路径，避免 /login 被无限重定向，注入 x-pathname 以便 layout 能读取
   const skipPathsLiteral = JSON.stringify(skipPaths);
   const skipInjection = `
   /* edgeone-middleware-skip-paths */
@@ -213,7 +205,6 @@ function convertProxyToMiddlewareForBuild() {
   if (destructureRegex.test(content)) {
     content = content.replace(destructureRegex, `$1${skipInjection}`);
   } else {
-    // 兜底：直接在函数签名后插入
     const fallback = `
   /* edgeone-middleware-skip-paths */
   const __edgeOnePathname = request.nextUrl.pathname;
@@ -233,7 +224,6 @@ function convertProxyToMiddlewareForBuild() {
   return true;
 }
 
-// 构建前：在 layout.tsx 的 RootLayout 函数体内注入服务端认证检查
 function injectLayoutAuthCheck() {
   const layoutPath = join(process.cwd(), 'src', 'app', 'layout.tsx');
   if (!existsSync(layoutPath)) {
@@ -247,7 +237,6 @@ function injectLayoutAuthCheck() {
   const marker = '/* edgeone-layout-auth-guard */';
   if (original.includes(marker)) return true;
 
-  // 添加 imports
   const importMarker = "import { cookies } from 'next/headers';";
   if (!original.includes(importMarker)) {
     console.warn('[edgeone-build] Cannot find cookies import in layout.tsx');
@@ -273,26 +262,44 @@ function injectLayoutAuthCheck() {
   }
 
   const authCheck = `
-  // EdgeOne SSR auth guard (Enhanced fallback)
+  // EdgeOne SSR auth guard (Secure Anti-Bypass Edition)
   const __h = await headers();
   let __path = __h.get('x-pathname') || __h.get('x-invoke-path') || '';
   
+  // 1. 尝试解析 EdgeOne / 代理转发的原始路径头
   if (!__path) {
-    // EdgeOne specific headers often contain the full original URI
-    const __eoUrl = __h.get('x-eo-request-url') || __h.get('x-forwarded-uri') || '';
+    const __eoUrl = __h.get('x-eo-request-url') || __h.get('x-original-uri') || __h.get('x-original-url') || __h.get('x-forwarded-uri') || '';
     if (__eoUrl) {
       try { __path = new URL(__eoUrl, 'http://localhost').pathname; } catch {}
     }
   }
 
+  // 2. 尝试解析 Next.js RSC 的请求头数据
+  if (!__path) {
+    const __rscPath = __h.get('x-nextjs-data');
+    if (__rscPath) {
+      __path = __rscPath.replace('.json', '');
+    }
+  }
+
+  // 3. 尝试解析来源 Referer
   if (!__path) {
     const __ref = __h.get('referer') || '';
     try { if (__ref) __path = new URL(__ref).pathname; } catch {}
   }
   
-  if (!__path) __path = '/login';
+  // 4. 精细化安全降级：防御越权 API 请求
+  if (!__path) {
+     const __accept = __h.get('accept') || '';
+     // 如果是页面加载 (HTML)，我们放行交由客户端二次鉴权处理以打破重定向循环
+     if (__accept.includes('text/html')) {
+         __path = '/login'; 
+     } else {
+         // 如果是敏感数据预取或 API 调用，强制拦截，阻止数据泄露风险
+         __path = '/';
+     }
+  }
 
-  // Critical fix: Ensure /login exactly matches regardless of trailing slash
   const __skipPaths = ${pageSkipPaths};
   const __isSkip = __skipPaths.some((p) => {
     if (p === '/login') {
@@ -305,7 +312,6 @@ function injectLayoutAuthCheck() {
     const __cookieStore = await cookies();
     const __authCookie = __cookieStore.get('user_auth') || __cookieStore.get('auth');
     if (!__authCookie) {
-      // 避免重复重定向到 login 导致死循环
       if (!__path.includes('login')) {
          const __search = __h.get('x-search') || '';
          redirect('/login?redirect=' + encodeURIComponent(__path + __search));
@@ -318,7 +324,7 @@ function injectLayoutAuthCheck() {
   content = content.slice(0, insertPos) + authCheck + content.slice(insertPos);
 
   writeFileSync(layoutPath, content);
-  console.log('[edgeone-build] Injected SSR auth check into RootLayout in layout.tsx');
+  console.log('[edgeone-build] Injected Secure SSR auth check into RootLayout in layout.tsx');
   return true;
 }
 
@@ -351,17 +357,14 @@ function restoreLayoutAfterBuild() {
   console.log('[edgeone-build] Restored layout.tsx');
 }
 
-// 构建前准备
 const wasConverted = convertProxyToMiddlewareForBuild();
 injectLayoutAuthCheck();
 
-// 确保异常退出时也能清理
 process.on('exit', () => {
   restoreProxyAfterBuild(wasConverted);
   restoreLayoutAfterBuild();
 });
 
-// 执行构建
 const isInsideEdgeOneBuilder = process.env.NEXT_PRIVATE_STANDALONE === 'true';
 
 const command = isInsideEdgeOneBuilder
@@ -382,7 +385,6 @@ child.on('exit', (code, signal) => {
 
     patchEdgeFunctionEnvInjection();
 
-    // 清理可能残留的 .env 文件
     for (const envPath of [
       join(process.cwd(), '.edgeone', '.env'),
       join(process.cwd(), '.edgeone', 'cloud-functions', 'ssr-node', '.env'),
