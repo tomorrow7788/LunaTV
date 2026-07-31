@@ -198,13 +198,15 @@ function convertProxyToMiddlewareForBuild() {
   );
 
   // 在 middleware 函数体开头注入跳过路径检查
-  // 替代原 matcher 负向前瞻排除的路径，避免 /login 被无限重定向
+  // 替代原 matcher 负向前瞻排除的路径，避免 /login 被无限重定向，注入 x-pathname 以便 layout 能读取
   const skipPathsLiteral = JSON.stringify(skipPaths);
   const skipInjection = `
   /* edgeone-middleware-skip-paths */
   const __edgeOneSkipPaths = ${skipPathsLiteral};
   if (__edgeOneSkipPaths.some((p) => pathname.startsWith(p))) {
-    return NextResponse.next();
+    const __reqHeaders = new Headers(request.headers);
+    __reqHeaders.set('x-pathname', pathname);
+    return NextResponse.next({ request: { headers: __reqHeaders } });
   }`;
 
   const destructureRegex = /(const\s*\{\s*pathname\s*\}\s*=\s*request\.nextUrl\s*;)/;
@@ -217,7 +219,9 @@ function convertProxyToMiddlewareForBuild() {
   const __edgeOnePathname = request.nextUrl.pathname;
   const __edgeOneSkipPaths = ${skipPathsLiteral};
   if (__edgeOneSkipPaths.some((p) => __edgeOnePathname.startsWith(p))) {
-    return NextResponse.next();
+    const __reqHeaders = new Headers(request.headers);
+    __reqHeaders.set('x-pathname', __edgeOnePathname);
+    return NextResponse.next({ request: { headers: __reqHeaders } });
   }`;
     const fnRegex = /(export\s+async\s+function\s+middleware\s*\([^)]*\)\s*\{)/;
     content = content.replace(fnRegex, `$1${fallback}`);
