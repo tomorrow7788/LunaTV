@@ -281,7 +281,7 @@ function injectLayoutAuthCheck() {
     const __ref = __h.get('referer') || '';
     try { if (__ref) __path = new URL(__ref).pathname; } catch {}
   }
-  if (!__path) __path = '/';
+  if (!__path) __path = '/login';
 
   const __skipPaths = ${pageSkipPaths};
   if (!__skipPaths.some((p) => __path.startsWith(p))) {
