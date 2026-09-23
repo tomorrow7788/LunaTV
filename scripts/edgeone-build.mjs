@@ -177,7 +177,7 @@ function patchEdgeFunctionEnvInjection() {
 
 // 构建前：将 proxy.ts 转换为 middleware.ts
 // EdgeOne 不完整支持 Next.js 16 proxy.ts，需要临时转换
-// 同时简化 matcher 并注入跳过路径及 Header 透传
+// 同时简化 matcher（EdgeOne 不支持负向前瞻正则）并注入跳过路径
 function convertProxyToMiddlewareForBuild() {
   const proxyPath = join(process.cwd(), 'src', 'proxy.ts');
   const middlewarePath = join(process.cwd(), 'src', 'middleware.ts');
@@ -190,35 +190,34 @@ function convertProxyToMiddlewareForBuild() {
 
   content = content.replace(/export async function proxy\b/, 'export async function middleware');
 
-  // 简化 matcher
+  // 简化 matcher：EdgeOne 不支持 (?!...)，改用匹配所有路径
+  // 注意：不能用 /:path+（不匹配根路径 /），必须用 /:path*
   content = content.replace(
     /export const config = \{[\s\S]*?matcher[\s\S]*?\};/,
     `export const config = { matcher: ['/', '/:path*'] };`
   );
 
-  // 注入跳过路径检查，并透传 x-pathname 请求头给下游 SSR
+  // 在 middleware 函数体开头注入跳过路径检查
+  // 替代原 matcher 负向前瞻排除的路径，避免 /login 被无限重定向
   const skipPathsLiteral = JSON.stringify(skipPaths);
   const skipInjection = `
   /* edgeone-middleware-skip-paths */
   const __edgeOneSkipPaths = ${skipPathsLiteral};
   if (__edgeOneSkipPaths.some((p) => pathname.startsWith(p))) {
-    const __reqHeaders = new Headers(request.headers);
-    __reqHeaders.set('x-pathname', pathname);
-    return NextResponse.next({ request: { headers: __reqHeaders } });
+    return NextResponse.next();
   }`;
 
   const destructureRegex = /(const\s*\{\s*pathname\s*\}\s*=\s*request\.nextUrl\s*;)/;
   if (destructureRegex.test(content)) {
     content = content.replace(destructureRegex, `$1${skipInjection}`);
   } else {
+    // 兜底：直接在函数签名后插入
     const fallback = `
   /* edgeone-middleware-skip-paths */
   const __edgeOnePathname = request.nextUrl.pathname;
   const __edgeOneSkipPaths = ${skipPathsLiteral};
   if (__edgeOneSkipPaths.some((p) => __edgeOnePathname.startsWith(p))) {
-    const __reqHeaders = new Headers(request.headers);
-    __reqHeaders.set('x-pathname', __edgeOnePathname);
-    return NextResponse.next({ request: { headers: __reqHeaders } });
+    return NextResponse.next();
   }`;
     const fnRegex = /(export\s+async\s+function\s+middleware\s*\([^)]*\)\s*\{)/;
     content = content.replace(fnRegex, `$1${fallback}`);
@@ -231,6 +230,9 @@ function convertProxyToMiddlewareForBuild() {
 }
 
 // 构建前：在 layout.tsx 的 RootLayout 函数体内注入服务端认证检查
+// EdgeOne 页面请求绕过 edge middleware，需要在 SSR 层（RootLayout）做认证
+// 注意：layout.tsx 有两处 await cookies()，第一处在 generateMetadata，第二处才在 RootLayout
+// 必须注入到 RootLayout 内的那处，否则 generateMetadata 会触发 redirect 导致整个 app 崩溃
 function injectLayoutAuthCheck() {
   const layoutPath = join(process.cwd(), 'src', 'app', 'layout.tsx');
   if (!existsSync(layoutPath)) {
@@ -244,6 +246,7 @@ function injectLayoutAuthCheck() {
   const marker = '/* edgeone-layout-auth-guard */';
   if (original.includes(marker)) return true;
 
+  // 添加 imports
   const importMarker = "import { cookies } from 'next/headers';";
   if (!original.includes(importMarker)) {
     console.warn('[edgeone-build] Cannot find cookies import in layout.tsx');
@@ -254,6 +257,8 @@ function injectLayoutAuthCheck() {
     `${importMarker}\n${marker}\nimport { redirect } from 'next/navigation';\nimport { headers } from 'next/headers';`
   );
 
+  // 找 RootLayout 函数体内的 await cookies()，不是第一个（generateMetadata 里的）
+  // 通过先定位 "export default async function RootLayout" 再在其后找 await cookies()
   const rootLayoutMarker = 'export default async function RootLayout(';
   const rootLayoutIdx = content.indexOf(rootLayoutMarker);
   if (rootLayoutIdx === -1) {
@@ -268,37 +273,23 @@ function injectLayoutAuthCheck() {
     return false;
   }
 
-  // 修复核心：多重提取 pathname，若无法确认绝对路径则安全放行，杜绝回退为 '/' 导致的登录死循环
   const authCheck = `
   // EdgeOne SSR auth guard
   const __h = await headers();
-  let __path = __h.get('x-pathname') || __h.get('x-invoke-path') || __h.get('x-matched-path') || '';
-
-  if (!__path) {
-    const __fullUrl = __h.get('x-url') || __h.get('x-original-url') || __h.get('x-forwarded-uri') || '';
-    if (__fullUrl) {
-      try { __path = new URL(__fullUrl, 'http://localhost').pathname; } catch {}
-    }
-  }
-
+  let __path = __h.get('x-pathname') || __h.get('x-invoke-path') || '';
   if (!__path) {
     const __ref = __h.get('referer') || '';
-    if (__ref) {
-      try { __path = new URL(__ref).pathname; } catch {}
-    }
+    try { if (__ref) __path = new URL(__ref).pathname; } catch {}
   }
+  if (!__path) __path = '/';
 
-  // 只有明确能识别出路径，且不在放行名单中时才执行重定向
-  // 若 SSR 头完全丢失，不盲目假设为 '/'，防止 /login 页面反复死循环
-  if (__path) {
-    const __skipPaths = ${pageSkipPaths};
-    if (!__skipPaths.some((p) => __path.startsWith(p))) {
-      const __cookieStore = await cookies();
-      const __authCookie = __cookieStore.get('user_auth') || __cookieStore.get('auth');
-      if (!__authCookie) {
-        const __search = __h.get('x-search') || '';
-        redirect('/login?redirect=' + encodeURIComponent(__path + __search));
-      }
+  const __skipPaths = ${pageSkipPaths};
+  if (!__skipPaths.some((p) => __path.startsWith(p))) {
+    const __cookieStore = await cookies();
+    const __authCookie = __cookieStore.get('user_auth') || __cookieStore.get('auth');
+    if (!__authCookie) {
+      const __search = __h.get('x-search') || '';
+      redirect('/login?redirect=' + encodeURIComponent(__path + __search));
     }
   }
 `;
